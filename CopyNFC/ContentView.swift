@@ -13,17 +13,25 @@ import CoreNFC
 struct ContentView: View {
     @StateObject private var nfcReader = NFCReader()
 
+    @State private var showDetailSheet = false
+    @State private var selectedTag: SavedNFC?
+
     var body: some View {
         NavigationView {
             Form {
                 Section(header: Text("Actions")) {
-                    Button(action: { nfcReader.scan() }) {
-                        Text("Scan")
-                            .font(.title)
+                    Button(action: { nfcReader.scanTag() }) {
+                        Text("Scan tag")
+                    }
+                    Button(action: { nfcReader.scanReader() }) {
+                        Text("Scan reader")
                     }
                 }
                 
                 Section(header: Text("Tags")) {
+                    if nfcReader.nfcTags.isEmpty {
+                        Text("No tags saved yet")
+                    }
                     ForEach(nfcReader.nfcTags) { tag in
                         Button(action: { onTagPress(tag) }) {
                             Text(tag.id.uuidString)
@@ -33,31 +41,103 @@ struct ContentView: View {
             }
             .navigationTitle(Text("Copy NFC"))
             .navigationBarTitleDisplayMode(.large)
+            .onChange(of: selectedTag, perform: { newValue in showDetailSheet = newValue != nil })
+            .sheet(isPresented: $showDetailSheet) {
+                Button(action: {
+                    guard let selectedTag else {
+                        showDetailSheet = false
+                        return
+                    }
+
+                    nfcReader.writeDataToTag(selectedTag)
+                }) {
+                    Text("Write")
+                }
+            }
         }
     }
 
     private func onTagPress(_ tag: SavedNFC) {
-        print("tag", tag)
+        selectedTag = tag
     }
 }
 
-class NFCReader: NSObject, NFCTagReaderSessionDelegate, ObservableObject {
+class NFCReader: NSObject, ObservableObject, NFCTagReaderSessionDelegate, NFCNDEFReaderSessionDelegate {
     @Published private(set) var nfcTags: [SavedNFC] {
         didSet { UserDefaults.savedNFCs = nfcTags }
     }
 
-    var tagSession: NFCTagReaderSession?
+    private var tagSession: NFCTagReaderSession?
+    private var readSession: NFCNDEFReaderSession?
 
     override init() {
         self.nfcTags = UserDefaults.savedNFCs ?? []
+
+        super.init()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.scanTag()
+        }
     }
 
-    func scan() {
+    func scanTag() {
         tagSession = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
         tagSession!.begin()
     }
 
-    // MARK: delegate methods
+    func scanReader() {
+        readSession = NFCNDEFReaderSession(delegate: self, queue: .main, invalidateAfterFirstRead: false)
+        readSession!.begin()
+    }
+
+    func writeDataToTag(_ tag: SavedNFC) {
+        print("tag", tag)
+
+        let tagUIDData = tag.identifier
+        var byteData: [UInt8] = []
+        tagUIDData.withUnsafeBytes { byteData.append(contentsOf: $0) }
+
+        var uidString = ""
+        for byte in byteData {
+            let decimalNumber = String(byte, radix: 16)
+            if (Int(decimalNumber) ?? 0) < 10 { // add leading zero
+                uidString.append("0\(decimalNumber)")
+            } else {
+                uidString.append(decimalNumber)
+            }
+        }
+        print("uidString", uidString)
+
+        // These properties prepare a T2T write command to write a 4 byte block at a specific block offset.
+        let writeBlockCommand: UInt8 = 0xA2
+        let successCode: UInt8 = 0x0A
+        let blockSize = 4
+        var blockData: Data = tag.identifier.prefix(blockSize)
+
+        // You need to zero-pad the data to fill the block size.
+        if blockData.count < blockSize {
+            blockData += Data(count: blockSize - blockData.count)
+        }
+
+        let writeCommand = Data([writeBlockCommand, 4]) + blockData
+        print("writeCommand", writeCommand)
+    }
+
+    // MARK: NFCNDEFReaderSessionDelegate
+
+    func readerSession(_ session: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
+        print(error.localizedDescription)
+    }
+
+    func readerSession(_ session: NFCNDEFReaderSession, didDetectNDEFs messages: [NFCNDEFMessage]) {
+        for message in messages {
+            for record in message.records {
+                print("record", record)
+            }
+        }
+    }
+
+    // MARK: NFCTagReaderSessionDelegate
 
     func tagReaderSessionDidBecomeActive(_ session: NFCTagReaderSession) {
         print(session)
@@ -68,6 +148,7 @@ class NFCReader: NSObject, NFCTagReaderSessionDelegate, ObservableObject {
     }
 
     func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
+        print("tags", tags)
         for tag in tags {
             session.connect(to: tag) { [weak self] maybeError in
                 if let error = maybeError {
@@ -83,6 +164,8 @@ class NFCReader: NSObject, NFCTagReaderSessionDelegate, ObservableObject {
     // - MARK: Privates
 
     private func copyData(_ tag: NFCTag) {
+        print("tag", tag)
+
         if case let .miFare(tag) = tag {
             let apdu = NFCISO7816APDU(
                 instructionClass: 0,
@@ -109,6 +192,8 @@ class NFCReader: NSObject, NFCTagReaderSessionDelegate, ObservableObject {
 
                 Task {
                     await self.setNFCTags(self.nfcTags + [nfcToSave])
+
+                    self.tagSession?.invalidate()
                 }
             }
         }
